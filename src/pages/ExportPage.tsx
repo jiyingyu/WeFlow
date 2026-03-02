@@ -59,21 +59,6 @@ interface SessionRow extends AppChatSession {
   wechatId?: string
 }
 
-interface SessionMetrics {
-  totalMessages?: number
-  voiceMessages?: number
-  imageMessages?: number
-  videoMessages?: number
-  emojiMessages?: number
-  privateMutualGroups?: number
-  groupMemberCount?: number
-  groupMyMessages?: number
-  groupActiveSpeakers?: number
-  groupMutualFriends?: number
-  firstTimestamp?: number
-  lastTimestamp?: number
-}
-
 interface TaskProgress {
   current: number
   total: number
@@ -231,26 +216,8 @@ const getAvatarLetter = (name: string): string => {
   return [...name][0] || '?'
 }
 
-const valueOrDash = (value?: number): string => {
-  if (value === undefined || value === null) return '--'
-  return value.toLocaleString()
-}
-
-const timestampOrDash = (timestamp?: number): string => {
-  if (!timestamp) return '--'
-  return formatAbsoluteDate(timestamp * 1000)
-}
-
 const createTaskId = (): string => `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-const MESSAGE_COUNT_VIEWPORT_PREFETCH = 90
-const MESSAGE_COUNT_ACTIVE_TAB_WARMUP_LIMIT = 240
-const MESSAGE_COUNT_REQUEST_BATCH = 120
-const METRICS_VIEWPORT_PREFETCH = 60
-const METRICS_REQUEST_BATCH = 24
-const METRICS_BACKGROUND_BATCH = 20
-const METRICS_BACKGROUND_INTERVAL_MS = 500
 const CONTACT_ENRICH_TIMEOUT_MS = 7000
-const EXPORT_SESSION_COUNT_CACHE_STALE_MS = 48 * 60 * 60 * 1000
 const EXPORT_SNS_STATS_CACHE_STALE_MS = 12 * 60 * 60 * 1000
 
 const withTimeout = async <T,>(promise: Promise<T>, timeoutMs: number): Promise<T | null> => {
@@ -333,8 +300,6 @@ function ExportPage() {
   const [isBaseConfigLoading, setIsBaseConfigLoading] = useState(true)
   const [isTaskCenterExpanded, setIsTaskCenterExpanded] = useState(false)
   const [sessions, setSessions] = useState<SessionRow[]>([])
-  const [sessionMessageCounts, setSessionMessageCounts] = useState<Record<string, number>>({})
-  const [sessionMetrics, setSessionMetrics] = useState<Record<string, SessionMetrics>>({})
   const [searchKeyword, setSearchKeyword] = useState('')
   const [activeTab, setActiveTab] = useState<ConversationTab>('private')
   const [selectedSessions, setSelectedSessions] = useState<Set<string>>(new Set())
@@ -390,21 +355,10 @@ function ExportPage() {
   const runningTaskIdRef = useRef<string | null>(null)
   const tasksRef = useRef<ExportTask[]>([])
   const hasSeededSnsStatsRef = useRef(false)
-  const sessionMessageCountsRef = useRef<Record<string, number>>({})
-  const sessionMetricsRef = useRef<Record<string, SessionMetrics>>({})
   const sessionLoadTokenRef = useRef(0)
-  const loadingMessageCountsRef = useRef<Set<string>>(new Set())
-  const loadingMetricsRef = useRef<Set<string>>(new Set())
-  const pendingMessageCountsRef = useRef<Set<string>>(new Set())
-  const pendingMetricsRef = useRef<Set<string>>(new Set())
-  const messageCountPumpRunningRef = useRef(false)
-  const metricsPumpRunningRef = useRef(false)
-  const isExportRouteRef = useRef(isExportRoute)
   const preselectAppliedRef = useRef(false)
-  const visibleSessionsRef = useRef<SessionRow[]>([])
   const exportCacheScopeRef = useRef('default')
   const exportCacheScopeReadyRef = useRef(false)
-  const persistSessionCountTimerRef = useRef<number | null>(null)
 
   useEffect(() => {
     tasksRef.current = tasks
@@ -413,42 +367,6 @@ function ExportPage() {
   useEffect(() => {
     hasSeededSnsStatsRef.current = hasSeededSnsStats
   }, [hasSeededSnsStats])
-
-  useEffect(() => {
-    sessionMessageCountsRef.current = sessionMessageCounts
-  }, [sessionMessageCounts])
-
-  useEffect(() => {
-    sessionMetricsRef.current = sessionMetrics
-  }, [sessionMetrics])
-
-  useEffect(() => {
-    isExportRouteRef.current = isExportRoute
-  }, [isExportRoute])
-
-  useEffect(() => {
-    if (persistSessionCountTimerRef.current) {
-      window.clearTimeout(persistSessionCountTimerRef.current)
-      persistSessionCountTimerRef.current = null
-    }
-
-    if (isBaseConfigLoading || !exportCacheScopeReadyRef.current) return
-
-    const countSize = Object.keys(sessionMessageCounts).length
-    if (countSize === 0) return
-
-    persistSessionCountTimerRef.current = window.setTimeout(() => {
-      void configService.setExportSessionMessageCountCache(exportCacheScopeRef.current, sessionMessageCounts)
-      persistSessionCountTimerRef.current = null
-    }, 900)
-
-    return () => {
-      if (persistSessionCountTimerRef.current) {
-        window.clearTimeout(persistSessionCountTimerRef.current)
-        persistSessionCountTimerRef.current = null
-      }
-    }
-  }, [sessionMessageCounts, isBaseConfigLoading])
 
   const preselectSessionIds = useMemo(() => {
     const state = location.state as { preselectSessionIds?: unknown; preselectSessionId?: unknown } | null
@@ -490,10 +408,7 @@ function ExportPage() {
       exportCacheScopeRef.current = exportCacheScope
       exportCacheScopeReadyRef.current = true
 
-      const [cachedSessionCountMap, cachedSnsStats] = await Promise.all([
-        configService.getExportSessionMessageCountCache(exportCacheScope),
-        configService.getExportSnsStatsCache(exportCacheScope)
-      ])
+      const cachedSnsStats = await configService.getExportSnsStatsCache(exportCacheScope)
 
       if (savedPath) {
         setExportFolder(savedPath)
@@ -506,10 +421,6 @@ function ExportPage() {
       setLastExportBySession(savedSessionMap)
       setLastExportByContent(savedContentMap)
       setLastSnsExportPostCount(savedSnsPostCount)
-
-      if (cachedSessionCountMap && Date.now() - cachedSessionCountMap.updatedAt <= EXPORT_SESSION_COUNT_CACHE_STALE_MS) {
-        setSessionMessageCounts(cachedSessionCountMap.counts || {})
-      }
 
       if (cachedSnsStats && Date.now() - cachedSnsStats.updatedAt <= EXPORT_SNS_STATS_CACHE_STALE_MS) {
         setSnsStats({
@@ -591,12 +502,6 @@ function ExportPage() {
     sessionLoadTokenRef.current = loadToken
     setIsLoading(true)
     setIsSessionEnriching(false)
-    loadingMessageCountsRef.current.clear()
-    loadingMetricsRef.current.clear()
-    pendingMessageCountsRef.current.clear()
-    pendingMetricsRef.current.clear()
-    sessionMetricsRef.current = {}
-    setSessionMetrics({})
 
     const isStale = () => sessionLoadTokenRef.current !== loadToken
 
@@ -626,20 +531,6 @@ function ExportPage() {
 
         if (isStale()) return
         setSessions(baseSessions)
-        setSessionMessageCounts(prev => {
-          const next: Record<string, number> = {}
-          for (const session of baseSessions) {
-            const count = prev[session.username]
-            if (typeof count === 'number') {
-              next[session.username] = count
-              continue
-            }
-            if (typeof session.messageCountHint === 'number' && Number.isFinite(session.messageCountHint) && session.messageCountHint >= 0) {
-              next[session.username] = Math.floor(session.messageCountHint)
-            }
-          }
-          return next
-        })
         setIsLoading(false)
 
         // 后台补齐联系人字段（昵称、头像、类型），不阻塞首屏会话列表渲染。
@@ -726,12 +617,8 @@ function ExportPage() {
 
   useEffect(() => {
     if (isExportRoute) return
-    // 导出页隐藏时停止后台统计请求，避免与通讯录页面查询抢占。
+    // 导出页隐藏时停止后台联系人补齐请求，避免与通讯录页面查询抢占。
     sessionLoadTokenRef.current = Date.now()
-    loadingMessageCountsRef.current.clear()
-    loadingMetricsRef.current.clear()
-    pendingMessageCountsRef.current.clear()
-    pendingMetricsRef.current.clear()
     setIsSessionEnriching(false)
   }, [isExportRoute])
 
@@ -764,227 +651,11 @@ function ExportPage() {
         )
       })
       .sort((a, b) => {
-        const totalA = sessionMessageCounts[a.username]
-        const totalB = sessionMessageCounts[b.username]
-        const hasTotalA = typeof totalA === 'number'
-        const hasTotalB = typeof totalB === 'number'
-
-        if (hasTotalA && hasTotalB && totalB !== totalA) {
-          return totalB - totalA
-        }
-        if (hasTotalA !== hasTotalB) {
-          return hasTotalA ? -1 : 1
-        }
-
-        const latestA = sessionMetrics[a.username]?.lastTimestamp ?? a.lastTimestamp ?? 0
-        const latestB = sessionMetrics[b.username]?.lastTimestamp ?? b.lastTimestamp ?? 0
+        const latestA = a.sortTimestamp || a.lastTimestamp || 0
+        const latestB = b.sortTimestamp || b.lastTimestamp || 0
         return latestB - latestA
       })
-  }, [sessions, activeTab, searchKeyword, sessionMessageCounts, sessionMetrics])
-
-  useEffect(() => {
-    visibleSessionsRef.current = visibleSessions
-  }, [visibleSessions])
-
-  const ensureSessionMessageCounts = useCallback(async (targetSessions: SessionRow[]) => {
-    if (!isExportRouteRef.current) return
-    const currentCounts = sessionMessageCountsRef.current
-    for (const session of targetSessions) {
-      if (currentCounts[session.username] !== undefined) continue
-      if (loadingMessageCountsRef.current.has(session.username)) continue
-      pendingMessageCountsRef.current.add(session.username)
-    }
-    if (pendingMessageCountsRef.current.size === 0 || messageCountPumpRunningRef.current) return
-
-    messageCountPumpRunningRef.current = true
-    const loadTokenAtStart = sessionLoadTokenRef.current
-
-    try {
-      while (isExportRouteRef.current && loadTokenAtStart === sessionLoadTokenRef.current) {
-        const ids = Array.from(pendingMessageCountsRef.current).slice(0, MESSAGE_COUNT_REQUEST_BATCH)
-        if (ids.length === 0) break
-
-        for (const id of ids) {
-          pendingMessageCountsRef.current.delete(id)
-          loadingMessageCountsRef.current.add(id)
-        }
-
-        const chunkUpdates: Record<string, number> = {}
-
-        try {
-          const result = await withTimeout(window.electronAPI.chat.getSessionMessageCounts(ids), 10000)
-          if (!result) {
-            for (const id of ids) {
-              chunkUpdates[id] = 0
-            }
-          } else {
-            for (const id of ids) {
-              const value = result?.success && result.counts ? result.counts[id] : undefined
-              chunkUpdates[id] = typeof value === 'number' ? value : 0
-            }
-          }
-        } catch (error) {
-          console.error('加载会话总消息数失败:', error)
-          for (const id of ids) {
-            chunkUpdates[id] = 0
-          }
-        } finally {
-          for (const id of ids) {
-            loadingMessageCountsRef.current.delete(id)
-          }
-        }
-
-        if (loadTokenAtStart === sessionLoadTokenRef.current && Object.keys(chunkUpdates).length > 0) {
-          setSessionMessageCounts(prev => ({ ...prev, ...chunkUpdates }))
-        }
-      }
-    } finally {
-      messageCountPumpRunningRef.current = false
-    }
-  }, [])
-
-  const ensureSessionMetrics = useCallback(async (targetSessions: SessionRow[]) => {
-    if (!isExportRouteRef.current) return
-    const currentMetrics = sessionMetricsRef.current
-    for (const session of targetSessions) {
-      if (currentMetrics[session.username]) continue
-      if (loadingMetricsRef.current.has(session.username)) continue
-      pendingMetricsRef.current.add(session.username)
-    }
-    if (pendingMetricsRef.current.size === 0 || metricsPumpRunningRef.current) return
-
-    metricsPumpRunningRef.current = true
-    const loadTokenAtStart = sessionLoadTokenRef.current
-
-    try {
-      while (isExportRouteRef.current && loadTokenAtStart === sessionLoadTokenRef.current) {
-        const ids = Array.from(pendingMetricsRef.current).slice(0, METRICS_REQUEST_BATCH)
-        if (ids.length === 0) break
-
-        for (const id of ids) {
-          pendingMetricsRef.current.delete(id)
-          loadingMetricsRef.current.add(id)
-        }
-
-        const updates: Record<string, SessionMetrics> = {}
-
-        try {
-          const statsResult = await window.electronAPI.chat.getExportSessionStats(ids)
-          if (!statsResult.success || !statsResult.data) {
-            console.error('加载会话统计失败:', statsResult.error || '未知错误')
-            for (const id of ids) {
-              updates[id] = {
-                totalMessages: 0,
-                voiceMessages: 0,
-                imageMessages: 0,
-                videoMessages: 0,
-                emojiMessages: 0
-              }
-            }
-          } else {
-            for (const id of ids) {
-              const raw = statsResult.data[id]
-              // 成功响应但无明细时按 0 回填，避免该行反复重试导致滚动抖动。
-              updates[id] = {
-                totalMessages: raw?.totalMessages ?? 0,
-                voiceMessages: raw?.voiceMessages ?? 0,
-                imageMessages: raw?.imageMessages ?? 0,
-                videoMessages: raw?.videoMessages ?? 0,
-                emojiMessages: raw?.emojiMessages ?? 0,
-                privateMutualGroups: raw?.privateMutualGroups,
-                groupMemberCount: raw?.groupMemberCount,
-                groupMyMessages: raw?.groupMyMessages,
-                groupActiveSpeakers: raw?.groupActiveSpeakers,
-                groupMutualFriends: raw?.groupMutualFriends,
-                firstTimestamp: raw?.firstTimestamp,
-                lastTimestamp: raw?.lastTimestamp
-              }
-            }
-          }
-        } catch (error) {
-          console.error('加载会话统计分批失败:', error)
-          for (const id of ids) {
-            updates[id] = {
-              totalMessages: 0,
-              voiceMessages: 0,
-              imageMessages: 0,
-              videoMessages: 0,
-              emojiMessages: 0
-            }
-          }
-        } finally {
-          for (const id of ids) {
-            loadingMetricsRef.current.delete(id)
-          }
-        }
-
-        if (loadTokenAtStart === sessionLoadTokenRef.current && Object.keys(updates).length > 0) {
-          setSessionMetrics(prev => ({ ...prev, ...updates }))
-        }
-      }
-    } catch (error) {
-      console.error('加载会话统计失败:', error)
-    } finally {
-      metricsPumpRunningRef.current = false
-    }
-  }, [])
-
-  useEffect(() => {
-    if (!isExportRoute) return
-    const targets = visibleSessions.slice(0, MESSAGE_COUNT_VIEWPORT_PREFETCH)
-    void ensureSessionMessageCounts(targets)
-  }, [isExportRoute, visibleSessions, ensureSessionMessageCounts])
-
-  useEffect(() => {
-    if (!isExportRoute) return
-    if (sessions.length === 0) return
-    const activeTabTargets = sessions
-      .filter(session => session.kind === activeTab)
-      .sort((a, b) => (b.sortTimestamp || b.lastTimestamp || 0) - (a.sortTimestamp || a.lastTimestamp || 0))
-      .slice(0, MESSAGE_COUNT_ACTIVE_TAB_WARMUP_LIMIT)
-    if (activeTabTargets.length === 0) return
-    void ensureSessionMessageCounts(activeTabTargets)
-  }, [isExportRoute, sessions, activeTab, ensureSessionMessageCounts])
-
-  useEffect(() => {
-    if (!isExportRoute) return
-    const targets = visibleSessions.slice(0, METRICS_VIEWPORT_PREFETCH)
-    void ensureSessionMetrics(targets)
-  }, [isExportRoute, visibleSessions, ensureSessionMetrics])
-
-  const handleTableRangeChanged = useCallback((range: { startIndex: number; endIndex: number }) => {
-    if (!isExportRoute) return
-    const current = visibleSessionsRef.current
-    if (current.length === 0) return
-    const prefetch = Math.max(MESSAGE_COUNT_VIEWPORT_PREFETCH, METRICS_VIEWPORT_PREFETCH)
-    const start = Math.max(0, range.startIndex - prefetch)
-    const end = Math.min(current.length - 1, range.endIndex + prefetch)
-    if (end < start) return
-    const rangeSessions = current.slice(start, end + 1)
-    void ensureSessionMessageCounts(rangeSessions)
-    void ensureSessionMetrics(rangeSessions)
-  }, [isExportRoute, ensureSessionMessageCounts, ensureSessionMetrics])
-
-  useEffect(() => {
-    if (!isExportRoute) return
-    if (sessions.length === 0) return
-    const prioritySessions = [
-      ...sessions.filter(session => session.kind === activeTab),
-      ...sessions.filter(session => session.kind !== activeTab)
-    ]
-    let cursor = 0
-    const timer = window.setInterval(() => {
-      if (cursor >= prioritySessions.length) {
-        window.clearInterval(timer)
-        return
-      }
-      const chunk = prioritySessions.slice(cursor, cursor + METRICS_BACKGROUND_BATCH)
-      cursor += METRICS_BACKGROUND_BATCH
-      void ensureSessionMetrics(chunk)
-    }, METRICS_BACKGROUND_INTERVAL_MS)
-
-    return () => window.clearInterval(timer)
-  }, [isExportRoute, sessions, activeTab, ensureSessionMetrics])
+  }, [sessions, activeTab, searchKeyword])
 
   const selectedCount = selectedSessions.size
 
@@ -1519,64 +1190,16 @@ function ExportPage() {
   }
 
   const renderTableHeader = () => {
-    if (activeTab === 'private' || activeTab === 'former_friend') {
-      return (
-        <tr>
-          <th className="sticky-col">选择</th>
-          <th>会话名（头像/昵称/微信号）</th>
-          <th>总消息</th>
-          <th>语音</th>
-          <th>图片</th>
-          <th>视频</th>
-          <th>表情包</th>
-          <th>共同群聊数</th>
-          <th>最早时间</th>
-          <th>最新时间</th>
-          <th className="sticky-right">操作</th>
-        </tr>
-      )
-    }
-
-    if (activeTab === 'group') {
-      return (
-        <tr>
-          <th className="sticky-col">选择</th>
-          <th>会话名（群头像/群名称/群ID）</th>
-          <th>总消息</th>
-          <th>语音</th>
-          <th>图片</th>
-          <th>视频</th>
-          <th>表情包</th>
-          <th>我发的消息数</th>
-          <th>群人数</th>
-          <th>群发言人数</th>
-          <th>群共同好友数</th>
-          <th>最早时间</th>
-          <th>最新时间</th>
-          <th className="sticky-right">操作</th>
-        </tr>
-      )
-    }
-
     return (
       <tr>
         <th className="sticky-col">选择</th>
         <th>会话名（头像/名称/微信号）</th>
-        <th>总消息</th>
-        <th>语音</th>
-        <th>图片</th>
-        <th>视频</th>
-        <th>表情包</th>
-        <th>最早时间</th>
-        <th>最新时间</th>
         <th className="sticky-right">操作</th>
       </tr>
     )
   }
 
   const renderRowCells = (session: SessionRow) => {
-    const metrics = sessionMetrics[session.username]
-    const totalMessages = sessionMessageCounts[session.username]
     const checked = selectedSessions.has(session.username)
 
     return (
@@ -1592,46 +1215,6 @@ function ExportPage() {
         </td>
 
         <td>{renderSessionName(session)}</td>
-        <td>
-          {typeof totalMessages === 'number'
-            ? totalMessages.toLocaleString()
-            : (
-              <span className="count-loading">
-                统计中<span className="animated-ellipsis" aria-hidden="true">...</span>
-              </span>
-            )}
-        </td>
-        <td>{valueOrDash(metrics?.voiceMessages)}</td>
-        <td>{valueOrDash(metrics?.imageMessages)}</td>
-        <td>{valueOrDash(metrics?.videoMessages)}</td>
-        <td>{valueOrDash(metrics?.emojiMessages)}</td>
-
-        {(activeTab === 'private' || activeTab === 'former_friend') && (
-          <>
-            <td>{valueOrDash(metrics?.privateMutualGroups)}</td>
-            <td>{timestampOrDash(metrics?.firstTimestamp)}</td>
-            <td>{timestampOrDash(metrics?.lastTimestamp)}</td>
-          </>
-        )}
-
-        {activeTab === 'group' && (
-          <>
-            <td>{valueOrDash(metrics?.groupMyMessages)}</td>
-            <td>{valueOrDash(metrics?.groupMemberCount)}</td>
-            <td>{valueOrDash(metrics?.groupActiveSpeakers)}</td>
-            <td>{valueOrDash(metrics?.groupMutualFriends)}</td>
-            <td>{timestampOrDash(metrics?.firstTimestamp)}</td>
-            <td>{timestampOrDash(metrics?.lastTimestamp)}</td>
-          </>
-        )}
-
-        {activeTab === 'official' && (
-          <>
-            <td>{timestampOrDash(metrics?.firstTimestamp)}</td>
-            <td>{timestampOrDash(metrics?.lastTimestamp)}</td>
-          </>
-        )}
-
         <td className="sticky-right">{renderActionCell(session)}</td>
       </>
     )
@@ -1872,7 +1455,7 @@ function ExportPage() {
         {!showInitialSkeleton && (isLoading || isSessionEnriching) && (
           <div className="table-stage-hint">
             <Loader2 size={14} className="spin" />
-            {isLoading ? '导出板块数据加载中…' : '正在补充头像和统计…'}
+            {isLoading ? '导出板块数据加载中…' : '正在补充头像…'}
           </div>
         )}
 
@@ -1898,7 +1481,6 @@ function ExportPage() {
               data={visibleSessions}
               fixedHeaderContent={renderTableHeader}
               computeItemKey={(_, session) => session.username}
-              rangeChanged={handleTableRangeChanged}
               itemContent={(_, session) => renderRowCells(session)}
               overscan={420}
             />
