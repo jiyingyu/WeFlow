@@ -461,8 +461,6 @@ const createTaskId = (): string => `task-${Date.now()}-${Math.random().toString(
 const createExportDiagTraceId = (): string => `export-card-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
 const CONTACT_ENRICH_TIMEOUT_MS = 7000
 const EXPORT_SNS_STATS_CACHE_STALE_MS = 12 * 60 * 60 * 1000
-const EXPORT_SESSION_MESSAGE_COUNT_CACHE_STALE_MS = 12 * 60 * 60 * 1000
-const EXPORT_SESSION_CONTENT_METRIC_CACHE_STALE_MS = 12 * 60 * 60 * 1000
 const EXPORT_AVATAR_ENRICH_BATCH_SIZE = 80
 const CONTACTS_LIST_VIRTUAL_ROW_HEIGHT = 76
 const CONTACTS_LIST_VIRTUAL_OVERSCAN = 10
@@ -473,9 +471,6 @@ const EXPORT_CARD_DIAG_POLL_INTERVAL_MS = 1200
 const EXPORT_REENTER_SESSION_SOFT_REFRESH_MS = 5 * 60 * 1000
 const EXPORT_REENTER_CONTACTS_SOFT_REFRESH_MS = 5 * 60 * 1000
 const EXPORT_REENTER_SNS_SOFT_REFRESH_MS = 3 * 60 * 1000
-const EXPORT_CONTENT_STATS_FIRST_SCREEN_LIMIT = 120
-const EXPORT_CONTENT_STATS_CHUNK_SIZE = 80
-const EXPORT_CONTENT_STATS_CHUNK_CONCURRENCY = 2
 type SessionDataSource = 'cache' | 'network' | null
 type ContactsDataSource = 'cache' | 'network' | null
 
@@ -551,11 +546,6 @@ interface SessionContentMetric {
   transferMessages?: number
   redPacketMessages?: number
   callMessages?: number
-}
-
-interface SessionContentStatsProgress {
-  completed: number
-  total: number
 }
 
 interface SessionExportCacheMeta {
@@ -637,14 +627,6 @@ const withTimeout = async <T,>(promise: Promise<T>, timeoutMs: number): Promise<
       clearTimeout(timer)
     }
   }
-}
-
-const normalizeTimestampToMs = (value: unknown): number => {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return 0
-  if (value < 1000000000000) {
-    return Math.floor(value * 1000)
-  }
-  return Math.floor(value)
 }
 
 const toContactMapFromCaches = (
@@ -895,8 +877,6 @@ function ExportPage() {
   const [sessionMessageCounts, setSessionMessageCounts] = useState<Record<string, number>>({})
   const [isLoadingSessionCounts, setIsLoadingSessionCounts] = useState(false)
   const [sessionContentMetrics, setSessionContentMetrics] = useState<Record<string, SessionContentMetric>>({})
-  const [isLoadingSessionContentStats, setIsLoadingSessionContentStats] = useState(false)
-  const [sessionContentStatsProgress, setSessionContentStatsProgress] = useState<SessionContentStatsProgress>({ completed: 0, total: 0 })
   const [contactsListScrollTop, setContactsListScrollTop] = useState(0)
   const [contactsListViewportHeight, setContactsListViewportHeight] = useState(480)
   const [contactsLoadTimeoutMs, setContactsLoadTimeoutMs] = useState(DEFAULT_CONTACTS_LOAD_TIMEOUT_MS)
@@ -992,7 +972,6 @@ function ExportPage() {
   const activeTaskCountRef = useRef(0)
   const hasBaseConfigReadyRef = useRef(false)
   const sessionCountRequestIdRef = useRef(0)
-  const sessionContentStatsRequestIdRef = useRef(0)
   const activeTabRef = useRef<ConversationTab>('private')
 
   const appendFrontendDiagLog = useCallback((entry: ExportCardDiagLogEntry) => {
@@ -1558,190 +1537,12 @@ function ExportPage() {
     }
   }, [])
 
-  const loadSessionContentStats = useCallback(async (
-    sourceSessions: SessionRow[],
-    priorityTab: ConversationTab,
-    resolvedMessageCounts?: Record<string, number>,
-    options?: {
-      scopeKey?: string
-      seededMetrics?: Record<string, SessionContentMetric>
-    }
-  ) => {
-    const requestId = sessionContentStatsRequestIdRef.current + 1
-    sessionContentStatsRequestIdRef.current = requestId
-    const isStale = () => sessionContentStatsRequestIdRef.current !== requestId
-
-    const exportableSessions = sourceSessions.filter(session => session.hasSession)
-    if (exportableSessions.length === 0) {
-      setIsLoadingSessionContentStats(false)
-      setSessionContentStatsProgress({ completed: 0, total: 0 })
-      return
-    }
-
-    const readCount = (session: SessionRow): number | undefined => {
-      const resolved = normalizeMessageCount(resolvedMessageCounts?.[session.username])
-      if (typeof resolved === 'number') return resolved
-      const hinted = normalizeMessageCount(session.messageCountHint)
-      if (typeof hinted === 'number') return hinted
-      return undefined
-    }
-
-    const sortByMessageCountDesc = (a: SessionRow, b: SessionRow): number => {
-      const aCount = readCount(a)
-      const bCount = readCount(b)
-      const aHas = typeof aCount === 'number'
-      const bHas = typeof bCount === 'number'
-      if (aHas && bHas && aCount !== bCount) {
-        return (bCount as number) - (aCount as number)
-      }
-      if (aHas && !bHas) return -1
-      if (!aHas && bHas) return 1
-      const tsDiff = (b.sortTimestamp || b.lastTimestamp || 0) - (a.sortTimestamp || a.lastTimestamp || 0)
-      if (tsDiff !== 0) return tsDiff
-      return (a.displayName || a.username).localeCompare(b.displayName || b.username, 'zh-Hans-CN')
-    }
-
-    const currentTabSessions = exportableSessions
-      .filter(session => session.kind === priorityTab)
-      .sort(sortByMessageCountDesc)
-    const otherSessions = exportableSessions
-      .filter(session => session.kind !== priorityTab)
-      .sort(sortByMessageCountDesc)
-    const orderedSessionIds = [...currentTabSessions, ...otherSessions].map(session => session.username)
-
-    if (orderedSessionIds.length === 0) {
-      setIsLoadingSessionContentStats(false)
-      setSessionContentStatsProgress({ completed: 0, total: 0 })
-      return
-    }
-
-    const total = orderedSessionIds.length
-    const processedSessionIds = new Set<string>()
-    const mergedMetrics: Record<string, configService.ExportSessionContentMetricCacheEntry> = {}
-    for (const [sessionId, metricRaw] of Object.entries(options?.seededMetrics || {})) {
-      const metric: configService.ExportSessionContentMetricCacheEntry = {}
-      const totalMessages = normalizeMessageCount(metricRaw.totalMessages)
-      const voiceMessages = normalizeMessageCount(metricRaw.voiceMessages)
-      const imageMessages = normalizeMessageCount(metricRaw.imageMessages)
-      const videoMessages = normalizeMessageCount(metricRaw.videoMessages)
-      const emojiMessages = normalizeMessageCount(metricRaw.emojiMessages)
-      if (typeof totalMessages === 'number') metric.totalMessages = totalMessages
-      if (typeof voiceMessages === 'number') metric.voiceMessages = voiceMessages
-      if (typeof imageMessages === 'number') metric.imageMessages = imageMessages
-      if (typeof videoMessages === 'number') metric.videoMessages = videoMessages
-      if (typeof emojiMessages === 'number') metric.emojiMessages = emojiMessages
-      if (Object.keys(metric).length > 0) {
-        mergedMetrics[sessionId] = metric
-      }
-    }
-
-    for (const [sessionId, countRaw] of Object.entries(resolvedMessageCounts || {})) {
-      const count = normalizeMessageCount(countRaw)
-      if (typeof count !== 'number') continue
-      mergedMetrics[sessionId] = {
-        ...(mergedMetrics[sessionId] || {}),
-        totalMessages: count
-      }
-    }
-
-    const markChunkProcessed = (chunk: string[]) => {
-      for (const sessionId of chunk) {
-        processedSessionIds.add(sessionId)
-      }
-      if (!isStale()) {
-        setSessionContentStatsProgress({ completed: processedSessionIds.size, total })
-      }
-    }
-
-    const runChunk = async (chunk: string[]) => {
-      if (chunk.length === 0) return
-      const result = await withTimeout(
-        window.electronAPI.chat.getExportSessionStats(
-          chunk,
-          { includeRelations: false, allowStaleCache: true }
-        ),
-        25000
-      )
-      if (isStale()) return
-      if (result?.success && result.data) {
-        mergeSessionContentMetrics(result.data as Record<string, SessionExportMetric | undefined>)
-        for (const [sessionId, metricRaw] of Object.entries(result.data as Record<string, SessionExportMetric | undefined>)) {
-          if (!metricRaw) continue
-          const metric: configService.ExportSessionContentMetricCacheEntry = {}
-          const totalMessages = normalizeMessageCount(metricRaw.totalMessages)
-          const voiceMessages = normalizeMessageCount(metricRaw.voiceMessages)
-          const imageMessages = normalizeMessageCount(metricRaw.imageMessages)
-          const videoMessages = normalizeMessageCount(metricRaw.videoMessages)
-          const emojiMessages = normalizeMessageCount(metricRaw.emojiMessages)
-          if (typeof totalMessages === 'number') metric.totalMessages = totalMessages
-          if (typeof voiceMessages === 'number') metric.voiceMessages = voiceMessages
-          if (typeof imageMessages === 'number') metric.imageMessages = imageMessages
-          if (typeof videoMessages === 'number') metric.videoMessages = videoMessages
-          if (typeof emojiMessages === 'number') metric.emojiMessages = emojiMessages
-          if (Object.keys(metric).length === 0) continue
-          mergedMetrics[sessionId] = {
-            ...(mergedMetrics[sessionId] || {}),
-            ...metric
-          }
-        }
-      }
-      markChunkProcessed(chunk)
-    }
-
-    setIsLoadingSessionContentStats(true)
-    setSessionContentStatsProgress({ completed: 0, total })
-    try {
-      const immediateSessionIds = orderedSessionIds.slice(0, EXPORT_CONTENT_STATS_FIRST_SCREEN_LIMIT)
-
-      for (let i = 0; i < immediateSessionIds.length; i += EXPORT_CONTENT_STATS_CHUNK_SIZE) {
-        const chunk = immediateSessionIds.slice(i, i + EXPORT_CONTENT_STATS_CHUNK_SIZE)
-        await runChunk(chunk)
-        if (isStale()) return
-      }
-
-      const remainingIds = orderedSessionIds.filter((sessionId) => !processedSessionIds.has(sessionId))
-      const remainingChunks: string[][] = []
-      for (let i = 0; i < remainingIds.length; i += EXPORT_CONTENT_STATS_CHUNK_SIZE) {
-        const chunk = remainingIds.slice(i, i + EXPORT_CONTENT_STATS_CHUNK_SIZE)
-        if (chunk.length === 0) continue
-        remainingChunks.push(chunk)
-      }
-
-      let nextChunkIndex = 0
-      const workerCount = Math.min(EXPORT_CONTENT_STATS_CHUNK_CONCURRENCY, remainingChunks.length)
-      await Promise.all(Array.from({ length: workerCount }, async () => {
-        while (true) {
-          if (isStale()) return
-          const index = nextChunkIndex
-          nextChunkIndex += 1
-          if (index >= remainingChunks.length) return
-          await runChunk(remainingChunks[index])
-        }
-      }))
-    } catch (error) {
-      console.error('导出页加载会话内容统计失败:', error)
-    } finally {
-      if (!isStale()) {
-        setSessionContentStatsProgress({ completed: processedSessionIds.size, total })
-        setIsLoadingSessionContentStats(false)
-        if (options?.scopeKey && Object.keys(mergedMetrics).length > 0) {
-          try {
-            await configService.setExportSessionContentMetricCache(options.scopeKey, mergedMetrics)
-          } catch (cacheError) {
-            console.error('写入导出页会话媒体统计缓存失败:', cacheError)
-          }
-        }
-      }
-    }
-  }, [mergeSessionContentMetrics])
-
   const loadSessionMessageCounts = useCallback(async (
     sourceSessions: SessionRow[],
     priorityTab: ConversationTab,
     options?: {
       scopeKey?: string
       seededCounts?: Record<string, number>
-      forceRefreshAll?: boolean
     }
   ): Promise<Record<string, number>> => {
     const requestId = sessionCountRequestIdRef.current + 1
@@ -1780,22 +1581,11 @@ function ExportPage() {
       return { ...accumulatedCounts }
     }
 
-    const pendingSessions = exportableSessions.filter((session) => {
-      if (options?.forceRefreshAll) return true
-      const persistedCount = normalizeMessageCount(seededPersistentCounts[session.username])
-      // messageCountHint 仅用于占位展示，不作为“已完成统计”的依据。
-      return typeof persistedCount !== 'number'
-    })
-    if (pendingSessions.length === 0) {
-      setIsLoadingSessionCounts(false)
-      return { ...accumulatedCounts }
-    }
-
-    const prioritizedSessionIds = pendingSessions
+    const prioritizedSessionIds = exportableSessions
       .filter(session => session.kind === priorityTab)
       .map(session => session.username)
     const prioritizedSet = new Set(prioritizedSessionIds)
-    const remainingSessionIds = pendingSessions
+    const remainingSessionIds = exportableSessions
       .filter(session => !prioritizedSet.has(session.username))
       .map(session => session.username)
 
@@ -1862,12 +1652,9 @@ function ExportPage() {
     setIsLoading(true)
     setIsSessionEnriching(false)
     sessionCountRequestIdRef.current += 1
-    sessionContentStatsRequestIdRef.current += 1
     setSessionMessageCounts({})
     setSessionContentMetrics({})
     setIsLoadingSessionCounts(false)
-    setIsLoadingSessionContentStats(false)
-    setSessionContentStatsProgress({ completed: 0, total: 0 })
 
     const isStale = () => sessionLoadTokenRef.current !== loadToken
 
@@ -1877,12 +1664,10 @@ function ExportPage() {
 
       const [
         cachedContactsPayload,
-        cachedMessageCountsPayload,
-        cachedContentMetricsPayload
+        cachedMessageCountsPayload
       ] = await Promise.all([
         loadContactsCaches(scopeKey),
-        configService.getExportSessionMessageCountCache(scopeKey),
-        configService.getExportSessionContentMetricCache(scopeKey)
+        configService.getExportSessionMessageCountCache(scopeKey)
       ])
       if (isStale()) return
 
@@ -1930,68 +1715,14 @@ function ExportPage() {
           return acc
         }, {})
 
-        const cachedContentMetrics = Object.entries(cachedContentMetricsPayload?.metrics || {}).reduce<Record<string, SessionContentMetric>>((acc, [sessionId, metricRaw]) => {
-          if (!exportableSessionIdSet.has(sessionId)) return acc
-          if (!metricRaw || typeof metricRaw !== 'object') return acc
-          const metric: SessionContentMetric = {}
-          const totalMessages = normalizeMessageCount(metricRaw.totalMessages)
-          const voiceMessages = normalizeMessageCount(metricRaw.voiceMessages)
-          const imageMessages = normalizeMessageCount(metricRaw.imageMessages)
-          const videoMessages = normalizeMessageCount(metricRaw.videoMessages)
-          const emojiMessages = normalizeMessageCount(metricRaw.emojiMessages)
-          if (typeof totalMessages === 'number') metric.totalMessages = totalMessages
-          if (typeof voiceMessages === 'number') metric.voiceMessages = voiceMessages
-          if (typeof imageMessages === 'number') metric.imageMessages = imageMessages
-          if (typeof videoMessages === 'number') metric.videoMessages = videoMessages
-          if (typeof emojiMessages === 'number') metric.emojiMessages = emojiMessages
-          if (Object.keys(metric).length > 0) {
-            acc[sessionId] = metric
-          }
-          return acc
-        }, {})
-
         const cachedCountAsMetrics = Object.entries(cachedMessageCounts).reduce<Record<string, SessionContentMetric>>((acc, [sessionId, count]) => {
-          if (typeof normalizeMessageCount(cachedContentMetrics[sessionId]?.totalMessages) === 'number') return acc
           acc[sessionId] = { totalMessages: count }
           return acc
         }, {})
 
-        const latestSessionActivityMs = baseSessions.reduce((maxTs, session) => {
-          const activityTs = normalizeTimestampToMs(session.sortTimestamp || session.lastTimestamp || 0)
-          return Math.max(maxTs, activityTs)
-        }, 0)
-        const messageCountCacheUpdatedAt = normalizeTimestampToMs(cachedMessageCountsPayload?.updatedAt || 0)
-        const contentMetricCacheUpdatedAt = normalizeTimestampToMs(cachedContentMetricsPayload?.updatedAt || 0)
-        const isMessageCountCacheFresh = (
-          messageCountCacheUpdatedAt > 0 &&
-          Date.now() - messageCountCacheUpdatedAt <= EXPORT_SESSION_MESSAGE_COUNT_CACHE_STALE_MS &&
-          latestSessionActivityMs <= messageCountCacheUpdatedAt
-        )
-        const isContentMetricCacheFresh = (
-          contentMetricCacheUpdatedAt > 0 &&
-          Date.now() - contentMetricCacheUpdatedAt <= EXPORT_SESSION_CONTENT_METRIC_CACHE_STALE_MS &&
-          latestSessionActivityMs <= contentMetricCacheUpdatedAt
-        )
-        const hasMessageCountCoverage = exportableSessionIds.every((sessionId) => (
-          typeof normalizeMessageCount(cachedMessageCounts[sessionId]) === 'number'
-        ))
-        const hasContentMetricCoverage = exportableSessionIds.every((sessionId) => {
-          const metric = cachedContentMetrics[sessionId]
-          if (!metric) return false
-          return (
-            typeof normalizeMessageCount(metric.imageMessages) === 'number' &&
-            typeof normalizeMessageCount(metric.voiceMessages) === 'number' &&
-            typeof normalizeMessageCount(metric.emojiMessages) === 'number' &&
-            typeof normalizeMessageCount(metric.videoMessages) === 'number'
-          )
-        })
-
         if (isStale()) return
         if (Object.keys(cachedMessageCounts).length > 0) {
           setSessionMessageCounts(cachedMessageCounts)
-        }
-        if (Object.keys(cachedContentMetrics).length > 0) {
-          mergeSessionContentMetrics(cachedContentMetrics)
         }
         if (Object.keys(cachedCountAsMetrics).length > 0) {
           mergeSessionContentMetrics(cachedCountAsMetrics)
@@ -1999,28 +1730,11 @@ function ExportPage() {
         setSessions(baseSessions)
         sessionsHydratedAtRef.current = Date.now()
         void (async () => {
-          let resolvedMessageCounts = { ...cachedMessageCounts }
-          const shouldRefreshMessageCounts = !isMessageCountCacheFresh || !hasMessageCountCoverage
-          if (shouldRefreshMessageCounts) {
-            resolvedMessageCounts = await loadSessionMessageCounts(baseSessions, activeTabRef.current, {
-              scopeKey,
-              seededCounts: cachedMessageCounts,
-              forceRefreshAll: !isMessageCountCacheFresh
-            })
-          } else {
-            setIsLoadingSessionCounts(false)
-          }
+          await loadSessionMessageCounts(baseSessions, activeTabRef.current, {
+            scopeKey,
+            seededCounts: cachedMessageCounts
+          })
           if (isStale()) return
-          const shouldRefreshContentStats = !isContentMetricCacheFresh || !hasContentMetricCoverage
-          if (shouldRefreshContentStats) {
-            await loadSessionContentStats(baseSessions, activeTabRef.current, resolvedMessageCounts, {
-              scopeKey,
-              seededMetrics: cachedContentMetrics
-            })
-          } else {
-            setIsLoadingSessionContentStats(false)
-            setSessionContentStatsProgress({ completed: 0, total: 0 })
-          }
         })()
         setSessionDataSource(cachedContacts.length > 0 ? 'cache' : 'network')
         if (cachedContacts.length === 0) {
@@ -2210,7 +1924,7 @@ function ExportPage() {
     } finally {
       if (!isStale()) setIsLoading(false)
     }
-  }, [ensureExportCacheScope, loadContactsCaches, loadSessionContentStats, loadSessionMessageCounts, mergeSessionContentMetrics, syncContactTypeCounts])
+  }, [ensureExportCacheScope, loadContactsCaches, loadSessionMessageCounts, mergeSessionContentMetrics, syncContactTypeCounts])
 
   useEffect(() => {
     if (!isExportRoute) return
@@ -2251,11 +1965,8 @@ function ExportPage() {
     // 导出页隐藏时停止后台联系人补齐请求，避免与通讯录页面查询抢占。
     sessionLoadTokenRef.current = Date.now()
     sessionCountRequestIdRef.current += 1
-    sessionContentStatsRequestIdRef.current += 1
     setIsSessionEnriching(false)
     setIsLoadingSessionCounts(false)
-    setIsLoadingSessionContentStats(false)
-    setSessionContentStatsProgress({ completed: 0, total: 0 })
   }, [isExportRoute])
 
   useEffect(() => {
@@ -4471,12 +4182,6 @@ function ExportPage() {
               消息总数统计中…
             </span>
           )}
-          {isLoadingSessionContentStats && (
-            <span className="meta-item syncing">
-              <Loader2 size={12} className="spin" />
-              图片/语音/表情包/视频统计中…（{sessionContentStatsProgress.completed}/{sessionContentStatsProgress.total}）
-            </span>
-          )}
         </div>
 
         {contactsList.length > 0 && isContactsListLoading && (
@@ -4533,7 +4238,7 @@ function ExportPage() {
               <>
                 <div className="contacts-list-header">
                   <span className="contacts-list-header-main">联系人（头像/名称/微信号）</span>
-                  <span className="contacts-list-header-count">总消息 | 图片 | 语音 | 表情包 | 视频</span>
+                  <span className="contacts-list-header-count">总消息</span>
                   <span className="contacts-list-header-actions">操作</span>
                 </div>
                 <div className="contacts-list" ref={contactsListRef} onScroll={onContactsListScroll}>
@@ -4550,40 +4255,14 @@ function ExportPage() {
                       const isQueued = canExport && queuedSessionIds.has(contact.username)
                       const isPaused = canExport && pausedSessionIds.has(contact.username)
                       const recent = canExport ? formatRecentExportTime(lastExportBySession[contact.username], nowTick) : ''
-                      const contentMetric = sessionContentMetrics[contact.username]
                       const countedMessages = normalizeMessageCount(sessionMessageCounts[contact.username])
-                      const metricMessages = normalizeMessageCount(contentMetric?.totalMessages)
                       const hintedMessages = normalizeMessageCount(matchedSession?.messageCountHint)
-                      const displayedMessageCount = countedMessages ?? metricMessages ?? hintedMessages
-                      const displayedImageCount = normalizeMessageCount(contentMetric?.imageMessages)
-                      const displayedVoiceCount = normalizeMessageCount(contentMetric?.voiceMessages)
-                      const displayedEmojiCount = normalizeMessageCount(contentMetric?.emojiMessages)
-                      const displayedVideoCount = normalizeMessageCount(contentMetric?.videoMessages)
+                      const displayedMessageCount = countedMessages ?? hintedMessages
                       const messageCountLabel = !canExport
                         ? '--'
                         : typeof displayedMessageCount === 'number'
                           ? displayedMessageCount.toLocaleString('zh-CN')
                           : (isLoadingSessionCounts ? '统计中…' : '--')
-                      const imageCountLabel = !canExport
-                        ? '--'
-                        : typeof displayedImageCount === 'number'
-                          ? displayedImageCount.toLocaleString('zh-CN')
-                          : (isLoadingSessionContentStats ? '统计中…' : '0')
-                      const voiceCountLabel = !canExport
-                        ? '--'
-                        : typeof displayedVoiceCount === 'number'
-                          ? displayedVoiceCount.toLocaleString('zh-CN')
-                          : (isLoadingSessionContentStats ? '统计中…' : '0')
-                      const emojiCountLabel = !canExport
-                        ? '--'
-                        : typeof displayedEmojiCount === 'number'
-                          ? displayedEmojiCount.toLocaleString('zh-CN')
-                          : (isLoadingSessionContentStats ? '统计中…' : '0')
-                      const videoCountLabel = !canExport
-                        ? '--'
-                        : typeof displayedVideoCount === 'number'
-                          ? displayedVideoCount.toLocaleString('zh-CN')
-                          : (isLoadingSessionContentStats ? '统计中…' : '0')
                       return (
                         <div
                           key={contact.username}
@@ -4608,30 +4287,6 @@ function ExportPage() {
                                   <span className="label">总消息</span>
                                   <strong className={`row-message-count-value ${typeof displayedMessageCount === 'number' ? '' : 'muted'}`}>
                                     {messageCountLabel}
-                                  </strong>
-                                </span>
-                                <span className="row-message-stat">
-                                  <span className="label">图片</span>
-                                  <strong className={`row-message-count-value ${typeof displayedImageCount === 'number' ? '' : 'muted'}`}>
-                                    {imageCountLabel}
-                                  </strong>
-                                </span>
-                                <span className="row-message-stat">
-                                  <span className="label">语音</span>
-                                  <strong className={`row-message-count-value ${typeof displayedVoiceCount === 'number' ? '' : 'muted'}`}>
-                                    {voiceCountLabel}
-                                  </strong>
-                                </span>
-                                <span className="row-message-stat">
-                                  <span className="label">表情包</span>
-                                  <strong className={`row-message-count-value ${typeof displayedEmojiCount === 'number' ? '' : 'muted'}`}>
-                                    {emojiCountLabel}
-                                  </strong>
-                                </span>
-                                <span className="row-message-stat">
-                                  <span className="label">视频</span>
-                                  <strong className={`row-message-count-value ${typeof displayedVideoCount === 'number' ? '' : 'muted'}`}>
-                                    {videoCountLabel}
                                   </strong>
                                 </span>
                               </div>
