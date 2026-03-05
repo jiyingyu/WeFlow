@@ -5029,10 +5029,21 @@ function ExportPage() {
     const voiceMetric = metricToDisplay(mediaMetric?.voiceMessages)
     const imageMetric = metricToDisplay(mediaMetric?.imageMessages)
     const videoMetric = metricToDisplay(mediaMetric?.videoMessages)
-    const isSnsCountLoading = snsUserPostCountsStatus === 'loading' || snsUserPostCountsStatus === 'idle'
+    const supportsSnsTimeline = isSingleContactSession(contact.username)
+    const hasSnsCount = Object.prototype.hasOwnProperty.call(snsUserPostCounts, contact.username)
+    const snsStageStatus = sessionLoadTraceMap[contact.username]?.snsPostCounts?.status
+    const isSnsCountLoading = (
+      supportsSnsTimeline &&
+      !hasSnsCount &&
+      (
+        snsStageStatus === 'pending' ||
+        snsStageStatus === 'loading' ||
+        snsUserPostCountsStatus === 'loading' ||
+        snsUserPostCountsStatus === 'idle'
+      )
+    )
     const snsRawCount = Number(snsUserPostCounts[contact.username] || 0)
     const snsCount = Number.isFinite(snsRawCount) ? Math.max(0, Math.floor(snsRawCount)) : 0
-    const supportsSnsTimeline = isSingleContactSession(contact.username)
     const openChatLabel = contact.type === 'friend'
       ? '打开私聊'
       : contact.type === 'group'
@@ -5126,7 +5137,9 @@ function ExportPage() {
                 >
                   {isSnsCountLoading
                     ? <Loader2 size={12} className="spin row-media-metric-icon" aria-label="朋友圈统计加载中" />
-                    : `${snsCount.toLocaleString('zh-CN')} 条`}
+                    : hasSnsCount
+                      ? `${snsCount.toLocaleString('zh-CN')} 条`
+                      : '--'}
                 </button>
               ) : (
                 <strong className="row-media-metric-value">--</strong>
@@ -5176,6 +5189,7 @@ function ExportPage() {
     selectedSessions,
     sessionDetail?.wxid,
     sessionContentMetrics,
+    sessionLoadTraceMap,
     sessionMessageCounts,
     sessionRowByUsername,
     showSessionDetailPanel,
