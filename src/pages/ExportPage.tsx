@@ -4290,6 +4290,11 @@ function ExportPage() {
     if (activeTab === 'group') return '群聊'
     return '曾经的好友'
   }, [activeTab])
+  const contactsHeaderMainLabel = useMemo(() => {
+    if (activeTab === 'group') return '群聊名称'
+    if (activeTab === 'private' || activeTab === 'former_friend') return '联系人'
+    return '联系人（头像/名称/微信号）'
+  }, [activeTab])
   const shouldShowSnsColumn = useMemo(() => (
     activeTab === 'private' || activeTab === 'former_friend'
   ), [activeTab])
@@ -5677,7 +5682,7 @@ function ExportPage() {
                     </button>
                   </span>
                   <span className="contacts-list-header-main">
-                    <span className="contacts-list-header-main-label">联系人（头像/名称/微信号）</span>
+                    <span className="contacts-list-header-main-label">{contactsHeaderMainLabel}</span>
                   </span>
                   <span className="contacts-list-header-count">总消息数</span>
                   <span className="contacts-list-header-media">表情包</span>
