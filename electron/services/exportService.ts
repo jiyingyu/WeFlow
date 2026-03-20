@@ -46,6 +46,8 @@ interface ChatLabMessage {
   timestamp: number
   type: number
   content: string | null
+  platformMessageId?: string
+  replyToMessageId?: string
   chatRecords?: any[]  // 嵌套的聊天记录
 }
 
@@ -952,6 +954,18 @@ class ExportService {
     return fallback
   }
 
+  private getRowField(row: Record<string, any>, keys: string[]): any {
+    for (const key of keys) {
+      if (row && Object.prototype.hasOwnProperty.call(row, key)) {
+        const value = row[key]
+        if (value !== undefined && value !== null && value !== '') {
+          return value
+        }
+      }
+    }
+    return undefined
+  }
+
   private normalizeUnsignedIntToken(value: unknown): string {
     const raw = String(value ?? '').trim()
     if (!raw) return '0'
@@ -963,14 +977,14 @@ class ExportService {
     return String(Math.floor(num))
   }
 
-  private getStableMessageKey(msg: { localId?: unknown; createTime?: unknown; serverId?: unknown }): string {
+  private getStableMessageKey(msg: { localId?: unknown; createTime?: unknown; serverId?: unknown; serverIdRaw?: unknown }): string {
     const localId = this.normalizeUnsignedIntToken(msg?.localId)
     const createTime = this.normalizeUnsignedIntToken(msg?.createTime)
-    const serverId = this.normalizeUnsignedIntToken(msg?.serverId)
+    const serverId = this.normalizeUnsignedIntToken(msg?.serverIdRaw ?? msg?.serverId)
     return `${localId}:${createTime}:${serverId}`
   }
 
-  private getMediaCacheKey(msg: { localType?: unknown; localId?: unknown; createTime?: unknown; serverId?: unknown }): string {
+  private getMediaCacheKey(msg: { localType?: unknown; localId?: unknown; createTime?: unknown; serverId?: unknown; serverIdRaw?: unknown }): string {
     const localType = this.normalizeUnsignedIntToken(msg?.localType)
     return `${localType}_${this.getStableMessageKey(msg)}`
   }
@@ -2462,6 +2476,23 @@ class ExportService {
     }
   }
 
+  private extractChatLabReplyToMessageId(content: string): string | undefined {
+    try {
+      const normalized = this.normalizeAppMessageContent(content || '')
+      const referMsgStart = normalized.indexOf('<refermsg>')
+      const referMsgEnd = normalized.indexOf('</refermsg>')
+      if (referMsgStart === -1 || referMsgEnd === -1) {
+        return undefined
+      }
+
+      const referMsgXml = normalized.substring(referMsgStart, referMsgEnd + 11)
+      const replyToMessageIdRaw = this.normalizeUnsignedIntToken(this.extractXmlValue(referMsgXml, 'svrid'))
+      return replyToMessageIdRaw !== '0' ? replyToMessageIdRaw : undefined
+    } catch {
+      return undefined
+    }
+  }
+
   private extractArkmeAppMessageMeta(content: string, localType: number): Record<string, any> | null {
     if (!content) return null
 
@@ -3507,6 +3538,13 @@ class ExportService {
             'msg_id', 'msgId', 'MsgId', 'id',
             'WCDB_CT_local_id'
           ], 0)
+          const rawServerIdValue = this.getRowField(row, [
+            'server_id', 'serverId', 'ServerId',
+            'msg_server_id', 'msgServerId', 'MsgServerId',
+            'svr_id', 'svrId', 'msg_svr_id', 'msgSvrId', 'MsgSvrId',
+            'WCDB_CT_server_id'
+          ])
+          const serverIdRaw = this.normalizeUnsignedIntToken(rawServerIdValue)
           const serverId = this.getIntFromRow(row, [
             'server_id', 'serverId', 'ServerId',
             'msg_server_id', 'msgServerId', 'MsgServerId',
@@ -3598,6 +3636,7 @@ class ExportService {
           rows.push({
             localId,
             serverId,
+            serverIdRaw: serverIdRaw !== '0' ? serverIdRaw : undefined,
             createTime,
             localType,
             content,
@@ -4438,6 +4477,16 @@ class ExportService {
           timestamp: msg.createTime,
           type: this.convertMessageType(msg.localType, msg.content),
           content: content
+        }
+
+        const platformMessageId = this.normalizeUnsignedIntToken(msg.serverIdRaw ?? msg.serverId)
+        if (platformMessageId !== '0') {
+          message.platformMessageId = platformMessageId
+        }
+
+        const replyToMessageId = this.extractChatLabReplyToMessageId(msg.content)
+        if (replyToMessageId) {
+          message.replyToMessageId = replyToMessageId
         }
 
         // 如果有聊天记录，添加为嵌套字段
