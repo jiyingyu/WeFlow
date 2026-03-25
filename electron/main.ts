@@ -2200,6 +2200,13 @@ function registerIpcHandlers() {
   })
 
   ipcMain.handle(
+    'groupAnalytics:getGroupMemberAnalytics',
+    async (_, chatroomId: string, memberUsername: string, startTime?: number, endTime?: number) => {
+      return groupAnalyticsService.getGroupMemberAnalytics(chatroomId, memberUsername, startTime, endTime)
+    }
+  )
+
+  ipcMain.handle(
     'groupAnalytics:getGroupMemberMessages',
     async (
       _,
@@ -2647,8 +2654,9 @@ function registerIpcHandlers() {
   })
 
   // HTTP API 服务
-  ipcMain.handle('http:start', async (_, port?: number) => {
-    return httpService.start(port || 5031)
+  ipcMain.handle('http:start', async (_, port?: number, host?: string) => {
+    const bindHost = typeof host === 'string' && host.trim() ? host.trim() : '127.0.0.1'
+    return httpService.start(port || 5031, bindHost)
   })
 
   ipcMain.handle('http:stop', async () => {
@@ -2866,6 +2874,8 @@ app.whenReady().then(async () => {
 
   // 启动时检测更新（不阻塞启动）
   checkForUpdatesOnStartup()
+
+  await httpService.autoStart()
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
