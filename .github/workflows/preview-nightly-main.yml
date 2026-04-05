@@ -70,17 +70,17 @@ jobs:
           echo "preview_version=$PREVIEW_VERSION" >> "$GITHUB_OUTPUT"
           echo "Preview version: $PREVIEW_VERSION (commits in last 24h on main: $COMMITS_24H, yearly count: $YEARLY_RUN_COUNT)"
 
-      - name: Ensure fixed preview prerelease exists
+      - name: Recreate fixed preview prerelease
+        if: steps.meta.outputs.should_build == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
           if gh release view "$FIXED_PREVIEW_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release edit "$FIXED_PREVIEW_TAG" --repo "$GITHUB_REPOSITORY" --title "Preview Nightly Build" --prerelease
-          else
-            gh release create "$FIXED_PREVIEW_TAG" --repo "$GITHUB_REPOSITORY" --title "Preview Nightly Build" --notes "预览版发布页" --prerelease
+            gh release delete "$FIXED_PREVIEW_TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
           fi
+          gh release create "$FIXED_PREVIEW_TAG" --repo "$GITHUB_REPOSITORY" --title "Preview Nightly Build" --notes "预览版发布页" --prerelease --target "$TARGET_BRANCH"
 
   preview-mac-arm64:
     needs: prepare

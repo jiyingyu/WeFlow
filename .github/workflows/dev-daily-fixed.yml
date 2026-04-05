@@ -45,17 +45,16 @@ jobs:
           echo "dev_version=$DEV_VERSION" >> "$GITHUB_OUTPUT"
           echo "Dev version: $DEV_VERSION"
 
-      - name: Ensure fixed prerelease exists
+      - name: Recreate fixed prerelease
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
           if gh release view "$FIXED_DEV_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release edit "$FIXED_DEV_TAG" --repo "$GITHUB_REPOSITORY" --title "Daily Dev Build" --prerelease
-          else
-            gh release create "$FIXED_DEV_TAG" --repo "$GITHUB_REPOSITORY" --title "Daily Dev Build" --notes "开发版发布页" --prerelease
+            gh release delete "$FIXED_DEV_TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
           fi
+          gh release create "$FIXED_DEV_TAG" --repo "$GITHUB_REPOSITORY" --title "Daily Dev Build" --notes "开发版发布页" --prerelease --target "$TARGET_BRANCH"
 
   dev-mac-arm64:
     needs: prepare
